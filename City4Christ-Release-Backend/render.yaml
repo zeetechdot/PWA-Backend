@@ -1,0 +1,47 @@
+# Free preview only: Render PostgreSQL expires after 30 days.
+# Email worker is omitted because Render workers have no free plan.
+# Never add database reset/seed commands here.
+previews:
+  generation: "off"
+services:
+  - type: web
+    name: city4christ-staging-api
+    runtime: docker
+    plan: free
+    region: oregon
+    autoDeployTrigger: checksPass
+    dockerfilePath: ./Dockerfile
+    branch: main
+    dockerCommand: /app/api migrate-and-serve
+    healthCheckPath: /health/ready
+    envVars:
+      - key: APP_ENV
+        value: staging
+      - key: APP_ORIGIN
+        fromService:
+          type: web
+          name: city4christ-staging-api
+          envVarKey: RENDER_EXTERNAL_URL
+      - key: CORS_ORIGINS
+        value: https://zeetechdot.github.io,https://city4christ-pwa.vercel.app,https://city4christ-pwa-git-feat-group-oversight-asura409s-projects.vercel.app
+      - key: REFRESH_COOKIE_SAME_SITE
+        value: none
+      - key: REGISTRATION_ENABLED
+        # Preserve the operator's current signup policy on Blueprint updates.
+        sync: false
+      - key: VERIFICATION_KEY_BASE64
+        generateValue: true
+      - key: DATABASE_URL
+        fromDatabase:
+          name: city4christ-staging-db
+          property: connectionString
+databases:
+  - name: city4christ-staging-db
+    databaseName: city4christ_staging
+    user: city4christ
+    plan: free
+    region: oregon
+    postgresMajorVersion: "16"
+    ipAllowList:
+      - source: 51.170.141.205/32
+        description: City4Christ VPS email worker

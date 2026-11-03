@@ -1,0 +1,417 @@
+package app
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/City4Christ/City4Christ-PWA-Backend/internal/auth"
+	"github.com/City4Christ/City4Christ-PWA-Backend/internal/database"
+	"github.com/City4Christ/City4Christ-PWA-Backend/internal/testpg"
+)
+
+func TestPrayerRoutesThroughGlobalAppEnforcePrivacy(t *testing.T) {
+	db := testpg.New(t)
+	ctx := context.Background()
+	if err := database.Migrate(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	key := []byte(strings.Repeat("p", 32))
+	sessions, err := auth.NewSessionService(db, auth.SessionConfig{Key: key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actor := func(email, role string) (string, string) {
+		t.Helper()
+		var id string
+		if err := db.QueryRow(`INSERT INTO accounts(email,first_name,last_name,email_verified_at) VALUES($1,'Prayer','Tester',now()) RETURNING id`, email).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		if role != "" {
+			if _, err := db.Exec(`INSERT INTO account_roles(account_id,role,scope) VALUES($1,$2,'')`, id, role); err != nil {
+				t.Fatal(err)
+			}
+		}
+		tokens, err := sessions.Start(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id, tokens.AccessToken
+	}
+	ownerID, ownerToken := actor("owner@example.invalid", "")
+	memberID, memberToken := actor("member@example.invalid", "")
+	_, outsiderToken := actor("outsider@example.invalid", "")
+	_, adminToken := actor("pastor@example.invalid", "super_administrator")
+	var groupID string
+	if err := db.QueryRow(`INSERT INTO groups(name,audience,join_policy,created_by) VALUES('Choir','church','open',$1) RETURNING id`, ownerID).Scan(&groupID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO group_memberships(group_id,account_id,status) VALUES($1,$2,'active'),($1,$3,'active')`, groupID, ownerID, memberID); err != nil {
+		t.Fatal(err)
+	}
+
+	h := New(db, Config{VerificationKey: key, AppOrigin: "https://api.example"})
+	request := func(method, path, token, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		r := httptest.NewRequest(method, path, strings.NewReader(body))
+		if body != "" {
+			r.Header.Set("Content-Type", "application/json")
+		}
+		if token != "" {
+			r.Header.Set("Authorization", "Bearer "+token)
+		}
+		if method != "GET" {
+			r.Header.Set("Origin", "https://api.example")
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w
+	}
+	create := func(token, body string) string {
+		t.Helper()
+		w := request("POST", "/api/v1/prayer/requests", token, body)
+		if w.Code != 201 {
+			t.Fatalf("create prayer: %d %s", w.Code, w.Body.String())
+		}
+		var response struct {
+			Data struct {
+				ID      string `json:"id"`
+				Author  string `json:"author"`
+				IsOwner bool   `json:"isOwner"`
+				Body    string `json:"body"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+			t.Fatal(err)
+		}
+		return response.Data.ID
+	}
+
+	if w := request("GET", "/api/v1/prayer/requests", "", ""); w.Code != 401 {
+		t.Fatalf("unauthenticated collection: %d %s", w.Code, w.Body.String())
+	}
+	communityID := create(ownerToken, `{"body":"Please pray for my family","visibility":"community","anonymous":true}`)
+	privateID := create(ownerToken, `{"body":"Sensitive private request","visibility":"private","anonymous":false}`)
+	groupPath := fmt.Sprintf(`{"body":"Prayer for our ministry","visibility":"group","groupId":%q}`, groupID)
+	groupRequestID := create(ownerToken, groupPath)
+	if w := request("POST", "/api/v1/prayer/requests", outsiderToken, groupPath); w.Code != 403 {
+		t.Fatalf("nonmember created a group request: %d %s", w.Code, w.Body.String())
+	}
+
+	outsiderFeed := request("GET", "/api/v1/prayer/requests?limit=20", outsiderToken, "")
+	if outsiderFeed.Code != 200 || !strings.Contains(outsiderFeed.Body.String(), communityID) || strings.Contains(outsiderFeed.Body.String(), privateID) || strings.Contains(outsiderFeed.Body.String(), groupRequestID) {
+		t.Fatalf("outsider collection leaked scoped request: %d %s", outsiderFeed.Code, outsiderFeed.Body.String())
+	}
+	if !strings.Contains(outsiderFeed.Body.String(), `"author":"Anonymous"`) || strings.Contains(outsiderFeed.Body.String(), ownerID) || strings.Contains(outsiderFeed.Body.String(), "owner@example.invalid") {
+		t.Fatalf("anonymous community attribution leaked: %s", outsiderFeed.Body.String())
+	}
+	memberFeed := request("GET", "/api/v1/prayer/requests?limit=20", memberToken, "")
+	if memberFeed.Code != 200 || !strings.Contains(memberFeed.Body.String(), groupRequestID) || strings.Contains(memberFeed.Body.String(), privateID) {
+		t.Fatalf("member collection has wrong group/private scope: %d %s", memberFeed.Code, memberFeed.Body.String())
+	}
+	adminFeed := request("GET", "/api/v1/prayer/requests?limit=20", adminToken, "")
+	if adminFeed.Code != 200 || strings.Contains(adminFeed.Body.String(), privateID) || strings.Contains(adminFeed.Body.String(), groupRequestID) {
+		t.Fatalf("staff role bypassed prayer privacy: %d %s", adminFeed.Code, adminFeed.Body.String())
+	}
+	for _, token := range []string{outsiderToken, adminToken} {
+		if w := request("GET", "/api/v1/prayer/requests/"+privateID, token, ""); w.Code != 404 {
+			t.Fatalf("hidden private detail disclosed to actor: %d %s", w.Code, w.Body.String())
+		}
+	}
+	for _, token := range []string{outsiderToken, adminToken} {
+		if w := request("GET", "/api/v1/prayer/requests/"+groupRequestID, token, ""); w.Code != 404 {
+			t.Fatalf("nonmember group detail disclosed: %d %s", w.Code, w.Body.String())
+		}
+	}
+	ownerDetail := request("GET", "/api/v1/prayer/requests/"+communityID, ownerToken, "")
+	if ownerDetail.Code != 200 || !strings.Contains(ownerDetail.Body.String(), `"isOwner":true`) || !strings.Contains(ownerDetail.Body.String(), `"author":"You"`) || strings.Contains(ownerDetail.Body.String(), `"authorId"`) {
+		t.Fatalf("owner detail lacks owner affordance or leaks IDs: %d %s", ownerDetail.Code, ownerDetail.Body.String())
+	}
+
+	for i := 0; i < 2; i++ {
+		if w := request("PUT", "/api/v1/prayer/requests/"+groupRequestID+"/prayed", memberToken, "{}"); w.Code != 200 {
+			t.Fatalf("I-prayed acknowledgement %d: %d %s", i, w.Code, w.Body.String())
+		}
+	}
+	groupDetail := request("GET", "/api/v1/prayer/requests/"+groupRequestID, memberToken, "")
+	if groupDetail.Code != 200 || !strings.Contains(groupDetail.Body.String(), `"prayerCount":1`) || !strings.Contains(groupDetail.Body.String(), `"hasPrayed":true`) {
+		t.Fatalf("duplicate acknowledgement was not idempotent: %d %s", groupDetail.Code, groupDetail.Body.String())
+	}
+	if w := request("PATCH", "/api/v1/prayer/requests/"+groupRequestID, memberToken, `{"status":"answered"}`); w.Code != 404 {
+		t.Fatalf("nonowner changed prayer status: %d %s", w.Code, w.Body.String())
+	}
+	if w := request("PATCH", "/api/v1/prayer/requests/"+communityID, ownerToken, `{"status":"answered"}`); w.Code != 200 || !strings.Contains(w.Body.String(), `"changed":true`) {
+		t.Fatalf("owner answer: %d %s", w.Code, w.Body.String())
+	}
+	answered := request("GET", "/api/v1/prayer/requests?status=answered", memberToken, "")
+	if answered.Code != 200 || !strings.Contains(answered.Body.String(), communityID) {
+		t.Fatalf("answered filter: %d %s", answered.Code, answered.Body.String())
+	}
+	if w := request("PATCH", "/api/v1/prayer/requests/"+communityID, ownerToken, `{"status":"archived"}`); w.Code != 200 {
+		t.Fatalf("owner archive: %d %s", w.Code, w.Body.String())
+	}
+	if w := request("GET", "/api/v1/prayer/requests/"+communityID, ownerToken, ""); w.Code != 404 {
+		t.Fatalf("archived request remained in detail: %d %s", w.Code, w.Body.String())
+	}
+	if err := database.Migrate(ctx, db); err != nil {
+		t.Fatalf("migration rerun: %v", err)
+	}
+	var count int
+	if err := db.QueryRow(`SELECT count(*) FROM prayer_requests WHERE id=$1 AND status='archived'`, communityID).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("migration rerun did not preserve request: count=%d err=%v", count, err)
+	}
+}
+
+func TestPrayerReportsModerationScopesAndExpiryThroughGlobalApp(t *testing.T) {
+	db := testpg.New(t)
+	ctx := context.Background()
+	if err := database.Migrate(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	key := []byte(strings.Repeat("m", 32))
+	sessions, err := auth.NewSessionService(db, auth.SessionConfig{Key: key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actor := func(email, role, scope string) (string, string) {
+		t.Helper()
+		var id string
+		if err := db.QueryRow(`INSERT INTO accounts(email,first_name,last_name,email_verified_at) VALUES($1,'Prayer','Actor',now()) RETURNING id`, email).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		if role != "" {
+			if _, err := db.Exec(`INSERT INTO account_roles(account_id,role,scope) VALUES($1,$2,$3)`, id, role, scope); err != nil {
+				t.Fatal(err)
+			}
+		}
+		tokens, err := sessions.Start(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id, tokens.AccessToken
+	}
+	ownerID, ownerToken := actor("owner2@example.invalid", "", "")
+	memberID, memberToken := actor("reporter@example.invalid", "", "")
+	leaderID, leaderToken := actor("leader2@example.invalid", "", "")
+	_, staffToken := actor("staff2@example.invalid", "staff", "")
+	_, adminToken := actor("admin2@example.invalid", "super_administrator", "")
+	var groupID string
+	if err := db.QueryRow(`INSERT INTO groups(name,audience,join_policy,created_by) VALUES('Worship','church','open',$1) RETURNING id`, ownerID).Scan(&groupID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO access_scopes(id,kind) VALUES($1,'ministry')`, groupID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO account_roles(account_id,role,scope) VALUES($1,'ministry_leader',$2)`, leaderID, groupID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO group_memberships(group_id,account_id,status) VALUES($1,$2,'active'),($1,$3,'active'),($1,$4,'active')`, groupID, ownerID, memberID, leaderID); err != nil {
+		t.Fatal(err)
+	}
+	h := New(db, Config{VerificationKey: key, AppOrigin: "https://api.example"})
+	request := func(method, path, token, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		r := httptest.NewRequest(method, path, strings.NewReader(body))
+		if body != "" {
+			r.Header.Set("Content-Type", "application/json")
+		}
+		if token != "" {
+			r.Header.Set("Authorization", "Bearer "+token)
+		}
+		if method != "GET" {
+			r.Header.Set("Origin", "https://api.example")
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w
+	}
+	create := func(token, body string) string {
+		t.Helper()
+		w := request("POST", "/api/v1/prayer/requests", token, body)
+		if w.Code != 201 {
+			t.Fatalf("create prayer %d %s", w.Code, w.Body.String())
+		}
+		var result struct {
+			Data struct {
+				ID string `json:"id"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+			t.Fatal(err)
+		}
+		return result.Data.ID
+	}
+	communityID := create(ownerToken, `{"body":"Community prayer content","visibility":"community","anonymous":true}`)
+	groupIDRequest := create(ownerToken, fmt.Sprintf(`{"body":"Group prayer content","visibility":"group","groupId":%q}`, groupID))
+	privateID := create(ownerToken, `{"body":"Private prayer content","visibility":"private"}`)
+	report := func(token, requestID string) string {
+		t.Helper()
+		w := request("POST", "/api/v1/prayer/requests/"+requestID+"/reports", token, `{"reason":"safety","details":"Please review."}`)
+		if w.Code != 201 {
+			t.Fatalf("file report %d %s", w.Code, w.Body.String())
+		}
+		var result struct {
+			Data struct {
+				ID string `json:"id"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(w.Body.String(), "reporterId") || strings.Contains(w.Body.String(), "authorId") {
+			t.Fatalf("report exposed identity: %s", w.Body.String())
+		}
+		return result.Data.ID
+	}
+	communityReportID := report(memberToken, communityID)
+	groupReportID := report(memberToken, groupIDRequest)
+	if w := request("POST", "/api/v1/prayer/requests/"+privateID+"/reports", memberToken, `{"reason":"safety"}`); w.Code != 404 {
+		t.Fatalf("private request was reportable: %d %s", w.Code, w.Body.String())
+	}
+	if w := request("GET", "/api/v1/prayer/reports", memberToken, ""); w.Code != 403 {
+		t.Fatalf("ordinary member read report queue: %d %s", w.Code, w.Body.String())
+	}
+	leaderQueue := request("GET", "/api/v1/prayer/reports?status=pending", leaderToken, "")
+	if leaderQueue.Code != 200 || !strings.Contains(leaderQueue.Body.String(), groupReportID) || strings.Contains(leaderQueue.Body.String(), communityReportID) || strings.Contains(leaderQueue.Body.String(), "reporter@example.invalid") || strings.Contains(leaderQueue.Body.String(), ownerID) {
+		t.Fatalf("leader queue leaked scope or identity: %d %s", leaderQueue.Code, leaderQueue.Body.String())
+	}
+	staffQueue := request("GET", "/api/v1/prayer/reports?status=pending", staffToken, "")
+	if staffQueue.Code != 200 || !strings.Contains(staffQueue.Body.String(), communityReportID) || strings.Contains(staffQueue.Body.String(), groupReportID) {
+		t.Fatalf("staff queue scope incorrect: %d %s", staffQueue.Code, staffQueue.Body.String())
+	}
+	adminQueue := request("GET", "/api/v1/prayer/reports?status=pending", adminToken, "")
+	if adminQueue.Code != 200 || !strings.Contains(adminQueue.Body.String(), communityReportID) || !strings.Contains(adminQueue.Body.String(), groupReportID) {
+		t.Fatalf("Super Admin queue scope incorrect: %d %s", adminQueue.Code, adminQueue.Body.String())
+	}
+	if w := request("PATCH", "/api/v1/prayer/reports/"+groupReportID, staffToken, `{"decision":"hide","reason":"Wrong scope"}`); w.Code != 404 {
+		t.Fatalf("staff reviewed group report: %d %s", w.Code, w.Body.String())
+	}
+	if w := request("PATCH", "/api/v1/prayer/reports/"+communityReportID, leaderToken, `{"decision":"dismiss","reason":"Wrong scope"}`); w.Code != 404 {
+		t.Fatalf("leader reviewed community report: %d %s", w.Code, w.Body.String())
+	}
+	if w := request("PATCH", "/api/v1/prayer/reports/"+groupReportID, leaderToken, `{"decision":"hide","reason":"Violates group policy."}`); w.Code != 200 {
+		t.Fatalf("leader moderation failed: %d %s", w.Code, w.Body.String())
+	}
+	if w := request("GET", "/api/v1/prayer/requests/"+groupIDRequest, ownerToken, ""); w.Code != 404 {
+		t.Fatalf("hidden request remained visible: %d %s", w.Code, w.Body.String())
+	}
+	if _, err := db.Exec(`UPDATE prayer_requests SET expires_at=now()-interval '1 second' WHERE id=$1`, communityID); err != nil {
+		t.Fatal(err)
+	}
+	if w := request("GET", "/api/v1/prayer/requests", memberToken, ""); w.Code != 200 || strings.Contains(w.Body.String(), communityID) {
+		t.Fatalf("expired prayer remained visible: %d %s", w.Code, w.Body.String())
+	}
+	var status, archiveReason, action string
+	if err := db.QueryRow(`SELECT p.status,p.archive_reason,e.action FROM prayer_requests p JOIN prayer_moderation_events e ON e.request_id=p.id WHERE p.id=$1`, communityID).Scan(&status, &archiveReason, &action); err != nil {
+		t.Fatal(err)
+	}
+	if status != "archived" || archiveReason != "expiry" || action != "expired" {
+		t.Fatalf("expiry record status=%q reason=%q event=%q", status, archiveReason, action)
+	}
+}
+
+func TestPrayerEncouragementRoutesThroughGlobalAppEnforceRequestPrivacy(t *testing.T) {
+	db := testpg.New(t)
+	ctx := context.Background()
+	if err := database.Migrate(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	key := []byte(strings.Repeat("e", 32))
+	sessions, err := auth.NewSessionService(db, auth.SessionConfig{Key: key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	makeActor := func(email string) (string, string) {
+		t.Helper()
+		var id string
+		if err := db.QueryRow(`INSERT INTO accounts(email,first_name,last_name,email_verified_at) VALUES($1,'Prayer','Actor',now()) RETURNING id`, email).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		tokens, err := sessions.Start(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id, tokens.AccessToken
+	}
+	owner, ownerToken := makeActor("prayer-owner@example.invalid")
+	member, memberToken := makeActor("prayer-member@example.invalid")
+	_, outsiderToken := makeActor("prayer-outsider@example.invalid")
+	h := New(db, Config{VerificationKey: key, AppOrigin: "https://api.example"})
+	request := func(method, path, token, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		r := httptest.NewRequest(method, path, strings.NewReader(body))
+		if body != "" {
+			r.Header.Set("Content-Type", "application/json")
+		}
+		r.Header.Set("Authorization", "Bearer "+token)
+		if method != "GET" {
+			r.Header.Set("Origin", "https://api.example")
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w
+	}
+	created := request("POST", "/api/v1/prayer/requests", ownerToken, `{"body":"Anonymous community request","visibility":"community","anonymous":true}`)
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create request: %d %s", created.Code, created.Body.String())
+	}
+	var envelope struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	path := "/api/v1/prayer/requests/" + envelope.Data.ID + "/encouragements"
+	posted := request("POST", path, memberToken, `{"body":"Standing with you in prayer"}`)
+	if posted.Code != http.StatusCreated || !strings.Contains(posted.Body.String(), `"author":"Prayer Actor"`) {
+		t.Fatalf("create encouragement: %d %s", posted.Code, posted.Body.String())
+	}
+	listed := request("GET", path, ownerToken, "")
+	if listed.Code != http.StatusOK || !strings.Contains(listed.Body.String(), "Standing with you in prayer") || !strings.Contains(listed.Body.String(), `"author":"Prayer Actor"`) || strings.Contains(listed.Body.String(), owner) {
+		t.Fatalf("owner list or anonymous request owner disclosure: %d %s", listed.Code, listed.Body.String())
+	}
+	private := request("POST", "/api/v1/prayer/requests", ownerToken, `{"body":"Private request","visibility":"private"}`)
+	if private.Code != http.StatusCreated {
+		t.Fatalf("create private: %d %s", private.Code, private.Body.String())
+	}
+	if err := json.Unmarshal(private.Body.Bytes(), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	privatePath := "/api/v1/prayer/requests/" + envelope.Data.ID + "/encouragements"
+	if w := request("GET", privatePath, outsiderToken, ""); w.Code != http.StatusNotFound {
+		t.Fatalf("private request list leaked: %d %s", w.Code, w.Body.String())
+	}
+	if w := request("POST", privatePath, outsiderToken, `{"body":"No access"}`); w.Code != http.StatusNotFound {
+		t.Fatalf("private request write leaked: %d %s", w.Code, w.Body.String())
+	}
+	var groupID string
+	if err := db.QueryRow(`INSERT INTO groups(name,audience,join_policy,created_by) VALUES('Prayer group','church','open',$1) RETURNING id`, owner).Scan(&groupID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO group_memberships(group_id,account_id,status) VALUES($1,$2,'active'),($1,$3,'active')`, groupID, owner, member); err != nil {
+		t.Fatal(err)
+	}
+	groupRequest := request("POST", "/api/v1/prayer/requests", ownerToken, fmt.Sprintf(`{"body":"Group prayer","visibility":"group","groupId":%q}`, groupID))
+	if groupRequest.Code != http.StatusCreated {
+		t.Fatalf("create group request: %d %s", groupRequest.Code, groupRequest.Body.String())
+	}
+	if err := json.Unmarshal(groupRequest.Body.Bytes(), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	groupPath := "/api/v1/prayer/requests/" + envelope.Data.ID + "/encouragements"
+	if w := request("GET", groupPath, outsiderToken, ""); w.Code != http.StatusNotFound {
+		t.Fatalf("out-of-group encouragement list disclosed request: %d %s", w.Code, w.Body.String())
+	}
+	if w := request("POST", groupPath, outsiderToken, `{"body":"No access"}`); w.Code != http.StatusNotFound {
+		t.Fatalf("out-of-group encouragement write disclosed request: %d %s", w.Code, w.Body.String())
+	}
+	if w := request("POST", groupPath, memberToken, `{"body":"Praying with you"}`); w.Code != http.StatusCreated {
+		t.Fatalf("active group member could not encourage: %d %s", w.Code, w.Body.String())
+	}
+}

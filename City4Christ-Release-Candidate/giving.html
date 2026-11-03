@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>City4Christ | Giving</title>
+<link rel="manifest" href="manifest.json"/>
+<meta name="theme-color" content="#5B2C83"/>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet"/>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet"/>
+<link href="css/style.css" rel="stylesheet"/>
+<link href="css/services.css" rel="stylesheet"/>
+</head>
+<body>
+<header class="app-header"><a aria-label="City4Christ home" class="header-logo" href="home.html"><img alt="City4Christ Logo" src="assets/images/logo.jpeg"/><span>City4Christ</span></a><div class="header-actions"><a aria-label="Back home" class="header-btn" href="home.html"><i class="bi bi-house-fill"></i></a><a aria-label="Profile" class="header-profile-btn" href="profile.html"><img alt="Profile" src="assets/images/maleMember.jpeg"/></a></div></header>
+<main class="service-page">
+<section class="service-hero giving-hero"><div><span class="service-kicker"><i class="bi bi-heart-fill"></i> Give With Purpose</span><h1>Giving</h1><p>Support the work of God through a simple, secure and beautiful giving experience.</p></div><div class="hero-symbol"><i class="bi bi-gift-fill"></i></div></section>
+<section class="giving-card">
+<div class="section-title compact"><div><span>Step 1</span><h2>Choose a giving category</h2></div></div>
+<div class="giving-types" id="givingTypes">
+<button class="giving-type active" data-type="Tithe" type="button"><i class="bi bi-wallet2"></i><span>Tithe</span></button>
+<button class="giving-type" data-type="Offering" type="button"><i class="bi bi-heart"></i><span>Offering</span></button>
+<button class="giving-type" data-type="Missions" type="button"><i class="bi bi-globe2"></i><span>Missions</span></button>
+<button class="giving-type" data-type="Welfare" type="button"><i class="bi bi-people"></i><span>Welfare</span></button>
+<button class="giving-type" data-type="Building Project" type="button"><i class="bi bi-building"></i><span>Building</span></button>
+<button class="giving-type" data-type="Special Seed" type="button"><i class="bi bi-stars"></i><span>Special Seed</span></button>
+</div>
+
+<div class="section-title compact top-gap"><div><span>Step 2</span><h2>Select payment method</h2></div></div>
+<div class="payment-methods">
+<button class="payment-method active" type="button" data-method="Card / Paystack"><span class="pay-icon"><i class="bi bi-credit-card-2-front-fill"></i></span><span><strong>Card / Paystack</strong><small>Visa, Mastercard and bank options</small></span><i class="bi bi-check-circle-fill check"></i></button>
+<button class="payment-method" type="button" data-method="Apple Pay"><span class="pay-icon apple"></span><span><strong>Apple Pay</strong><small>apple payment gateway</small></span><i class="bi bi-check-circle-fill check"></i></button>
+</div>
+<button class="primary-action full" id="continueGiving" type="button"><i class="bi bi-lock-fill"></i> Continue Securely</button>
+<p class="secure-note"><i class="bi bi-shield-check"></i> No real payment is processed in this frontend version.</p>
+</section>
+<div class="frontend-toast" id="frontendToast" role="status"></div>
+</main>
+<nav class="bottom-nav"><a href="home.html"><i class="bi bi-house-fill"></i><span>Home</span></a><a href="community.html"><i class="bi bi-people-fill"></i><span>Community</span></a><a class="post-nav-link" href="home.html#share-faith"><i class="bi bi-plus-lg"></i><span>Post</span></a><a href="prayer.html"><i class="bi bi-heart-fill"></i><span>Prayer</span></a><a href="word.html"><i class="bi bi-book-fill"></i><span>Word</span></a></nav>
+<script src="js/app.js"></script>
+<script>let selectedType='Tithe',selectedMethod='Card / Paystack';const amount=document.getElementById('giveAmount'),toast=document.getElementById('frontendToast');document.querySelectorAll('.giving-type').forEach(b=>b.addEventListener('click',()=>{document.querySelectorAll('.giving-type').forEach(x=>x.classList.remove('active'));b.classList.add('active');selectedType=b.dataset.type}));document.querySelectorAll('.quick-amounts button').forEach(b=>b.addEventListener('click',()=>amount.value=b.dataset.amount));document.querySelectorAll('.payment-method').forEach(b=>b.addEventListener('click',()=>{document.querySelectorAll('.payment-method').forEach(x=>x.classList.remove('active'));b.classList.add('active');selectedMethod=b.dataset.method}));function showToast(m){toast.textContent=m;toast.classList.add('show');setTimeout(()=>toast.classList.remove('show'),2600)}document.getElementById('continueGiving').addEventListener('click',()=>{if(!amount.value||Number(amount.value)<=0)return showToast('Enter an amount to continue.');showToast(`${selectedType} • ₦${Number(amount.value).toLocaleString()} • ${selectedMethod} — frontend preview only.`)});</script>
+</body>
+</html>

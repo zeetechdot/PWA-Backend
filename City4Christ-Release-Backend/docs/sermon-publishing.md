@@ -1,0 +1,91 @@
+# Sermon publishing and media links
+
+Editors use a verified, active Bearer session. The backend checks PostgreSQL for `content_editor` or `system_administrator` on every editor request; roles are not trusted from request bodies or JWT claims. No existing user is promoted by migrations, and no public role-assignment API is provided.
+
+## Routes
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| GET | `/api/v1/admin/sermons` | List all sermons for editors, including drafts and scheduled items |
+| POST | `/api/v1/admin/sermons` | Create a draft; always starts at version 1 |
+| GET | `/api/v1/admin/sermons/{sermonId}` | Read current metadata, status and version, including drafts |
+| PATCH | `/api/v1/admin/sermons/{sermonId}` | Edit metadata or change publication state using the current version |
+
+POST/PATCH require an allowed Origin, application/json, an active editor session and are limited to 60 attempts per editor per minute. Bodies are capped at 16 KiB; unknown fields are rejected. CORS preflight supports PATCH. Visitors continue to use the public catalog endpoints, which hide drafts and future publications.
+
+The editorial list requires `sermons.manage` and supports `query`, `status` (`draft`, `published` or `scheduled`), `limit` (default 20, maximum 100) and opaque `cursor` parameters. It returns each sermon’s current status, version, metadata and attachment IDs, ordered newest-created first. Continue with the `meta.nextCursor` from the response. Public catalog filtering is independent; drafts and future publications are never exposed through public routes.
+
+Create a draft:
+
+```json
+{
+  "title": "Living in Faith",
+  "summary": "A message about faith and community.",
+  "speaker": "Pastor Joy",
+  "series": "Foundations",
+  "topic": "Faith",
+  "preachedAt": "2026-10-11T14:00:00Z",
+  "videoUrl": "https://youtu.be/AbCdEf12345",
+  "imageUrl": "https://images.unsplash.com/photo-1770097286875-0cbf4ca2f8c1?auto=format&fit=crop&w=1200&q=80"
+}
+```
+
+The video ID is illustrative; use a church-approved video. Title and speaker are required (1–200 characters after trimming). Summary, series and topic default to empty strings, bounded to 10,000/200/100 characters. preachedAt is a required timestamp with an explicit offset and is normalized to UTC microsecond precision. Drafts do not appear publicly.
+
+Publish using the returned ID and current version:
+
+```json
+{ "version": 1, "status": "published" }
+```
+
+The response includes `version: 2`, `status: "published"`, and the server-assigned publishedAt. An already-published sermon retains its original publication timestamp during edits or repeated publish actions.
+
+Schedule publication:
+
+```json
+{ "version": 2, "status": "scheduled", "publishAt": "2027-01-10T15:00:00Z" }
+```
+
+Supply a timestamp that is future when the request is validated. Sub-microsecond values are truncated before checking the boundary. Scheduling an already-published sermon hides it immediately until the new instant. Visibility is evaluated during reads; no cron job is needed to publish on schedule.
+
+Unpublish:
+
+```json
+{ "version": 3, "status": "draft" }
+```
+
+This clears publishedAt and hides the sermon immediately. Editor detail returns publishedAt=null for drafts.
+
+Omitted fields retain their stored values exactly, including existing summary formatting. Normalization applies only to fields explicitly supplied.
+
+Metadata updates use the same PATCH endpoint, e.g. `{ "version": 4, "title": "Updated title" }`. Supply at least one change. Optional null fields are treated as omitted; use an empty string to clear summary, series, topic or videoUrl. Title and speaker cannot be cleared. publishAt must accompany status=scheduled and cannot be supplied for other statuses. publishedAt, role and actor cannot be assigned by clients.
+
+If another update committed first, return 409 `version_conflict` without modifying the sermon or adding an audit event. Reload editor detail and deliberately reconcile changes. Do not blindly retry with an incremented version.
+
+## Media policy
+
+Videos support public HTTPS YouTube watch and youtu.be links. Links normalize to `https://www.youtube.com/watch?v=VIDEO_ID`, where the ID has the supported eleven-character YouTube form. Start/tracking parameters are discarded. Credentials, ports, fragments, lookalike hosts and other providers are rejected. The database independently constrains stored URLs to the canonical form. The React sermon detail embeds the link using YouTube's privacy-enhanced `youtube-nocookie.com` host and retains a separate watch link.
+
+Optional `imageUrl` accepts only HTTPS `images.unsplash.com/photo-*` URLs. The application does not fetch the image; browsers load it directly under the frontend CSP. Empty values clear the image. The frontend checks the host again before rendering it. Keep the image URL and use only photos permitted for your content; the staging demo photos and their credits are listed in [demo-sermons.md](demo-sermons.md).
+
+Neither image nor video is downloaded, probed, proxied or stored as a file by the API. Validation checks URL format, not that media remains available or that the linked content belongs to the church. Replace demo material with church-approved content before public launch. Audio, other providers, private media and uploads require later explicit adapters/access policy.
+
+## Authorization and audit operations
+
+Only an approved database operator may provision staff roles outside this API. A role row belongs to a specific verified account ID. Use approved change tracking for grants/revocations; never grant editor access automatically during signup or staging seed scripts. Removing the role denies subsequent calls without refreshing the access token. Logout/replay revocation also invalidates editor authentication.
+
+Every successful create/edit/publication writes `sermon_audit_events` in the same transaction as the sermon change. Audit records contain actor, sermon, action, version, status at the time and UTC timestamp. They omit the sermon body, tokens and credentials. Audit insertion failure rolls back the change; row locks and version checks prevent lost updates. The API exposes no audit-edit/delete route. Foreign keys retain actor/sermon references, so future account-deletion and retention workflows must account for audit retention.
+
+Migration 00008 adds roles, version/video columns and audit records. Migration 00020 adds the optional image URL. Existing sermons retain their metadata and receive an empty image URL. No roles or demo content are seeded by migrations, and no staging reset is performed.
+
+## Demo content
+
+`node scripts/seed-demo-sermons.mjs` prints a dry-run plan. To add the six clearly labeled demo records to staging, set `CITY4CHRIST_API_URL`, `CITY4CHRIST_APP_ORIGIN`, and `CITY4CHRIST_ACCESS_TOKEN` in the current shell, then pass `--apply`. The token must belong to a verified content editor. The script only targets this staging API or a loopback development server, creates and publishes through the audited API, skips exact published title matches, and never edits or deletes existing records. It does not store or print the bearer token. See [demo-sermons.md](demo-sermons.md) for content/source details and a safe invocation.
+
+## Executed verification
+
+Publishing tests first failed on missing implementation and then the missing role schema. A failing read-only transaction regression led to using lock-compatible authorization transactions. Tests cover verified editor checks, member denial, revoked roles, the full draft/publish/unpublish/schedule lifecycle, publication boundaries, canonical media links, stale and concurrent updates, and rollback of both create and edit on audit failure.
+
+Global-app tests first failed with 404 before the editor routes were wired. They exercise real sessions and PostgreSQL, Origin checks, public draft visibility, PATCH preflight, validation, privilege-field rejection, audit errors, role revocation and logout. An additional failing regression caught PostgreSQL timestamp rounding at the scheduling boundary. All tests use disposable PostgreSQL rather than staging.
+
+Swagger UI enables PATCH in Try it out. Run `node scripts/test-swagger-config.cjs` to verify the actual initializer supports all editor methods and retains same-origin credentials without persisting authorization.
